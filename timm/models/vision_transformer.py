@@ -72,7 +72,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.fused_attn = use_fused_attn()
+        self.fused_attn = True
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -81,20 +81,30 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
+            if mask is None:
+                x = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.attn_drop.p if self.training else 0.,
+                )
+            else:
+                x = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.attn_drop.p if self.training else 0.,
+                    attn_mask=~mask,
+                )
+            attn = None
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
+            if mask is not None:
+                attn = attn.masked_fill(~mask, -torch.finfo(attn.dtype).max)
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
@@ -102,7 +112,8 @@ class Attention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        return {'data': x, 'attn': attn}
+        # return x
 
 
 class LayerScale(nn.Module):
@@ -161,9 +172,19 @@ class Block(nn.Module):
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        if type(x) is dict:
+            mask = x['mask']
+            data = x['data']
+        else:
+            data = x
+            mask = None
+        attn_rtn = self.attn(self.norm1(data), mask=mask)
+        attn_out, attn = attn_rtn['data'], attn_rtn['attn']
+        x = data + self.drop_path1(self.ls1(attn_out))
+
+        # x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-        return x
+        return {'data': x, 'attn': attn, 'mask': mask}
 
 
 class ResPostBlock(nn.Module):
@@ -518,6 +539,7 @@ class VisionTransformer(nn.Module):
                 mlp_layer=mlp_layer,
             )
             for i in range(depth)])
+        self.blocks[-1].attn.fused_attn = False
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
         # Classifier Head
@@ -674,6 +696,12 @@ class VisionTransformer(nn.Module):
             x = checkpoint_seq(self.blocks, x)
         else:
             x = self.blocks(x)
+        if type(x) is tuple:
+            x, attention = x
+        elif type(x) is dict:
+            x, attention = x['data'], x['attn']
+        else:
+            attention = None
         x = self.norm(x)
         return x
 
